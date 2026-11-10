@@ -30,8 +30,10 @@ def at(text):
 
 
 def cfg(**over):
+    # the reel's numbers (v2.0) have no costs in them; costs have their own tests (test_backtest.py)
     with open(CFG_PATH) as fh:
         c = json.load(fh)
+    c.pop("costs", None)
     c.update(over)
     return c
 
@@ -126,7 +128,8 @@ class TheReel(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("PASS  #1 buy TSLA 8 shares, entry", text)
             self.assertIn("entry 364.18 (the plan's entry), stop 358.32, target 370.04: risk 5.86 a share", text)
-            self.assertIn("max loss $46.88 (limit $50), reward:risk 1.00 (min 1)", text)
+            # the shipped config counts costs: 8 x (5.86 + 0.37 est. costs) = $49.86, still under $50
+            self.assertIn("max loss $49.86 (limit $50), reward:risk 1.00 (min 1)", text)
             self.assertIn("1 passed, 0 blocked at 2026-10-19 10:15 New York", text)
             self.assertIn("not financial advice", text)
             with open(out) as fh:
@@ -474,7 +477,7 @@ class Cli(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 self.assertEqual(check.main(base + ["--now", "2026-10-19 10:55"]), 1)
-            self.assertIn("8 shares x 8.16 risk a share = $65.28", buf.getvalue())
+            self.assertIn("8 shares x (8.16 risk + 0.37 est. costs) a share = $68.27", buf.getvalue())
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(check.main(base + ["--now", "2026-10-19 11:30"]), 0)
 

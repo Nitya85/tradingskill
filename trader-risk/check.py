@@ -39,7 +39,10 @@ What blocks an entry (on top):
   daily limit   max_orders_per_day orders placed today
   stop          no stop while "require_stop": true (a bracket stop_loss_stop_price
                 or the order's plan stop); a stop on the wrong side of the entry
-  loss          qty x (entry - stop) over max_loss_per_trade_usd. The entry is
+  loss          qty x (entry - stop + estimated costs) over max_loss_per_trade_usd
+                (the costs only when trader/config.json has "costs": spread and
+                slippage on the entry and the stop's market sell, plus fees,
+                trader-backtest's model). The entry is
                 the limit price for a limit order, else the HIGHER of the plan's
                 entry and a fresh price (under 15 minutes old), so a stale plan
                 cannot understate the risk
@@ -53,6 +56,11 @@ What blocks an entry (on top):
                 3 hours earlier too)
   pdt           only with "pdt_guard": true: 3 day trades already in the last
                 5 business days (a 4th would trip the old pattern-day-trader rule)
+  edge          the order's setup has no EDGE verdict from trader-backtest in
+                trader/state/edge.json from the last edge_max_age_days (7).
+                "require_edge": "live" (the default) blocks on a live account
+                and warns on paper; "always" blocks on paper too; "never" skips it.
+                Paper trading is where an unproven setup earns its evidence.
 
 Exit code 0 when every order passes, 1 when any order is blocked.
 The verdicts go to trader/state/risk.json with a fingerprint of each order,
@@ -62,6 +70,7 @@ so trader-broker only shows an order as ready if THIS exact order passed today.
 import argparse
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -73,8 +82,40 @@ DEFAULTS = {
     "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
-    "pdt_guard": False,
+    "pdt_guard": False, "require_edge": "live", "edge_max_age_days": 7,
 }
+SETUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-backtest", "setups.py")
+
+
+def cost_per_share(entry, stop, costs):
+    """Estimated extra loss a share at the stop (trader-backtest/setups.py), or None."""
+    if costs is None or not os.path.exists(SETUP_FILE):
+        return None
+    spec = importlib.util.spec_from_file_location("trader_setups", SETUP_FILE)
+    st = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(st)
+    try:
+        return st.cost_per_share(entry, stop, st.costs_for(costs))
+    except st.SetupError as e:
+        raise RiskError("costs in the config: %s" % e)
+
+
+def edge_problem(setup, edge, now_utc, max_age_days):
+    """None when trader-backtest's verdict for this setup is a fresh EDGE, else why not."""
+    entry = ((edge or {}).get("setups") or {}).get(setup)
+    if not entry:
+        return "no trader-backtest verdict for the %s setup in trader/state/edge.json" % setup
+    try:
+        t = datetime.datetime.strptime(entry.get("tested_at", ""), "%Y-%m-%dT%H:%M:%SZ")
+        age = (now_utc - t).days
+    except ValueError:
+        return "the %s verdict in trader/state/edge.json has no test date" % setup
+    if entry.get("verdict") != "EDGE":
+        return "trader-backtest says %s for %s (%s, tested %s)" % (entry.get("verdict"), setup,
+                                                                  entry.get("why", ""), t.date().isoformat())
+    if age > max_age_days:
+        return "the %s EDGE verdict is %d days old, over %d: re-run trader-backtest" % (setup, age, max_age_days)
+    return None
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
@@ -370,10 +411,12 @@ def day_trades(state, today):
 
 # ---------------------------------------------------------------- the check
 
-def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None):
+def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None,
+          edge=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
     now          naive UTC (default: the real clock); its New York date is "today"
+    edge         trader/state/edge.json as a dict ({} when the file is missing, None to skip the check)
     price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
@@ -594,11 +637,17 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     risk_c = int(round(abs(ref - stop) * 100))
                     risk_ps = risk_c / 100.0
                     shares = q if q is not None else ((value or 0) / ref)
-                    max_loss = round(shares * risk_ps, 2)
+                    cps = cost_per_share(ref, stop, c.get("costs")) if long else None
+                    max_loss = round(shares * (risk_ps + (cps or 0)), 2)
                     cap = _f(c.get("max_loss_per_trade_usd"))
                     if cap and max_loss > cap + CENT:
-                        later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
-                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
+                        if cps:
+                            later.append("loss: %s shares x (%s risk + %s est. costs) a share = %s at the stop, over "
+                                         "your %s max loss per trade" % (_num(shares), _p(risk_ps), _p(cps),
+                                                                         money(max_loss), money(cap)))
+                        else:
+                            later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
+                                         "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
                     min_rr = _f(c.get("min_reward_risk"))
                     if target:
                         if (long and target <= ref + CENT) or (not long and target >= ref - CENT):
@@ -624,6 +673,17 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
             later.extend(win_reasons)
+            setup = str(plan.get("setup") or "").lower()
+            mode = str(c.get("require_edge", "live")).lower()
+            if setup and edge is not None and mode not in ("never", "false", "none", "off"):
+                why_not = edge_problem(setup, edge, now_utc, int(c.get("edge_max_age_days") or 7))
+                if why_not:
+                    if mode == "always" or not c.get("paper", True):
+                        later.append("edge: %s. A setup goes live only with an EDGE verdict (\"require_edge\")"
+                                     % why_not)
+                    else:
+                        warns.append("edge: %s. Fine on paper, where it earns its evidence; a live account "
+                                     "would block it" % why_not)
             if c.get("pdt_guard") and pdt_n >= 3:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
@@ -632,6 +692,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 info.append("entry %s (%s), stop %s, target %s: risk %s a share"
                             % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
                                _p(target) if target else "none", _p(risk_ps)))
+                if cps:
+                    info.append("estimated costs %s a share (spread, slippage, fees) are in the max loss" % _p(cps))
                 info.append("max loss %s%s, reward:risk %s%s"
                             % (money(max_loss), (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
                                if _f(c.get("max_loss_per_trade_usd")) else "",
@@ -776,6 +838,7 @@ def main(argv=None):
     ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
+    ap.add_argument("--edge", default="trader/state/edge.json", help="trader-backtest's verdicts")
     ap.add_argument("--no-write", action="store_true", help="do not record the verdicts")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
@@ -792,7 +855,8 @@ def main(argv=None):
         pdoc = read_json(a.prices, "prices", required=False) or {}
         prices, times = load_prices(pdoc)
         state = read_json(a.state, "broker state", required=False)
-        res = check(orders, cfg, portfolio, prices, state, a.today, now, times)
+        edge = read_json(a.edge, "backtest verdicts", required=False) or {}
+        res = check(orders, cfg, portfolio, prices, state, a.today, now, times, edge)
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]
         if not a.no_write:

@@ -1,7 +1,7 @@
 {
   "name": "day-trader-skill",
-  "description": "11 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar.",
-  "version": "2.0.0",
+  "description": "12 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, replay every outcome, and prove an edge after costs before you risk a dollar.",
+  "version": "2.1.0",
   "author": {
     "name": "Jake Schincariol",
     "url": "https://opusjake.ai"
@@ -16,7 +16,9 @@
     "stock-market",
     "backtesting",
     "opening-range-breakout",
-    "paper-trading"
+    "paper-trading",
+    "walk-forward",
+    "transaction-costs"
   ],
   "skills": "./"
 }

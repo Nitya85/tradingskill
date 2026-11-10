@@ -16,7 +16,12 @@ checks the order and trader-broker asks you yes or no.
 How many shares. Whole shares only: Alpaca takes no fractions in a bracket.
 
     shares = floor of the smallest of
-      max loss       max_loss_per_trade_usd / risk per share (entry minus stop)
+      max loss       max_loss_per_trade_usd / (risk per share + estimated costs)
+                     risk = entry minus stop; the costs (only when trader/config.json
+                     has "costs", as config.example.json does) are the spread and
+                     slippage on the entry and on the stop's market sell, plus fees,
+                     the same model trader-backtest uses. Without "costs" the loss at
+                     the stop is the bare entry minus stop, which understates it.
       position cap   budget x max_position_pct / entry
       max order      max_order_usd / entry
       cash           (budget minus the cash buffer) / entry
@@ -53,10 +58,27 @@ Money that cannot be invested is reported as "left idle", never hidden.
 
 import argparse
 import datetime
+import importlib.util
 import json
 import math
 import os
 import sys
+
+SETUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-backtest", "setups.py")
+
+
+def cost_per_share(entry, stop, costs):
+    """Estimated extra loss a share at the stop (trader-backtest/setups.py's model).
+    None when no costs are configured or the setups file is not installed."""
+    if costs is None or not os.path.exists(SETUP_FILE):
+        return None
+    spec = importlib.util.spec_from_file_location("trader_setups", SETUP_FILE)
+    st = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(st)
+    try:
+        return st.cost_per_share(entry, stop, st.costs_for(costs))
+    except st.SetupError as e:
+        raise SizeError("costs in the config: %s" % e)
 
 # v2 defaults: the contract's config.example.json. Missing keys fall back to these.
 DEFAULTS = {
@@ -85,7 +107,8 @@ DEFAULTS = {
 }
 EPS = 1e-9
 FRESH_MINUTES = 15
-SETUP_WORDS = {"orb": "opening-range breakout", "flag": "flag", "bounce": "oversold bounce"}
+SETUP_WORDS = {"orb": "opening-range breakout", "flag": "flag", "bounce": "oversold bounce",
+               "vwap": "VWAP reclaim", "gap": "gap and go"}
 
 
 class SizeError(Exception):
@@ -364,10 +387,14 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     available = max(round(available, 2), 0.0)
 
     limits = []
+    cps = cost_per_share(ref, stop, c.get("costs"))
+    per = risk + cps if cps else risk
     max_loss = _f(c.get("max_loss_per_trade_usd"))
     if max_loss:
-        limits.append({"name": "max loss", "usd": max_loss, "per": risk, "shares": shares_for(max_loss, risk),
-                       "how": "%s max loss / %s risk a share" % (money(max_loss), _price(risk))})
+        how = ("%s max loss / (%s risk + %s est. costs) a share" % (money(max_loss), _price(risk), _price(cps))
+               if cps else "%s max loss / %s risk a share" % (money(max_loss), _price(risk)))
+        limits.append({"name": "max loss", "usd": max_loss, "per": round(per, 4),
+                       "shares": shares_for(max_loss, per), "how": how})
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
         cap = round(budget * cap_pct / 100.0, 2)
@@ -412,6 +439,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
         "cost": cost, "max_loss": loss, "flat_by": plan.get("flat_by") or c.get("flat_by"),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
+        "est_cost_per_share": round(cps, 4) if cps else None,
+        "max_loss_with_costs": round(qty * per, 2) if cps else None,
     }
 
 
@@ -438,6 +467,9 @@ def bracket_order(s):
                  "risk_per_share": s["risk_per_share"], "max_loss": s["max_loss"], "setup": s["setup"],
                  "entry_time": s["entry_time"], "flat_by": s["flat_by"]},
     })
+    if s.get("est_cost_per_share"):
+        o["plan"]["est_cost_per_share"] = s["est_cost_per_share"]
+        o["plan"]["max_loss_with_costs"] = s["max_loss_with_costs"]
     return o
 
 
@@ -469,6 +501,12 @@ def plan_report(s, order, notes=()):
     lines.append("Size: %d shares of %s = %s at %s. Max loss at the stop: %d x %s = %s."
                  % (s["qty"], s["symbol"], money(s["cost"]), _price(s["entry"]), s["qty"],
                     _price(s["risk_per_share"]), money(s["max_loss"])))
+    if s.get("max_loss_with_costs") is not None:
+        lines.append("With the estimated spread, slippage and fees: about %s (%s a share in costs)."
+                     % (money(s["max_loss_with_costs"]), _price(s["est_cost_per_share"])))
+    else:
+        lines.append("Costs are not counted (no \"costs\" in trader/config.json): the real loss at the stop "
+                     "is a little bigger.")
     lines.append("A stop is an order, not a promise: in a fast market it can fill below %s." % _price(s["stop"]))
     lines.append("")
     lines.append("Proposed bracket order (place_stock_order arguments, nothing has been placed):")

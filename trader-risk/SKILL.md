@@ -102,6 +102,23 @@ Warnings do not block, but say them to the user: a LIVE account, a number
 sent as a number instead of a string, a stop that lives only in the plan and
 not at the broker, a price too old to use, an early close today.
 
+## v2.1: costs and the proven-edge gate
+
+- **Costs in the max loss.** When `trader/config.json` has `costs` (the
+  example config does), the loss at the stop includes the estimated spread
+  and slippage on the entry and on the stop's market sell, plus fees:
+  qty x (entry - stop + costs). The reel's 8 TSLA shares are $49.86 at the
+  stop with costs, still under $50. The same model as trader-backtest.
+- **The edge gate.** Every entry's setup is looked up in
+  `trader/state/edge.json`, written by `/trader-backtest`. Without a fresh
+  EDGE verdict (7 days, `edge_max_age_days`):
+  - `"require_edge": "live"` (the default): a live account is BLOCKED; a
+    paper account gets a warning, because paper is where an unproven setup
+    earns its evidence.
+  - `"always"`: blocked on paper too. `"never"`: no check.
+  Tell the user the reason exactly as printed. Never suggest switching
+  require_edge off to get a live order through.
+
 ## Steps
 
 1. If the price may have moved since the plan, refresh it first

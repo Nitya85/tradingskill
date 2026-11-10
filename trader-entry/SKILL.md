@@ -5,14 +5,17 @@ description: >-
   Reads free Yahoo 1-minute or 5-minute bars, builds the opening range (the
   first 15 minutes by default) and calls the entry on the first completed bar
   that CLOSES above the range high, or above a level you give it (like a
-  20-day high from the scanner), with an optional volume check. Says waiting
+  20-day high from the scanner), with an optional volume check. v2.1 adds the
+  VWAP reclaim (vwap) and gap and go (gap) setups, defined in
+  trader-backtest/setups.py so the timer fires on exactly the rule the
+  backtest judged, with their own suggested stop. Says waiting
   and how far, triggered with the time and the price, expired, or not open
   yet, and writes trader/entry.json for /trader-exit. Long side only. It never
   places an order. Use when the user says "tell me when to get in", "watch
   TSLA", "has it broken out", "did it break the opening range", "entry
   signal", "time my entry", "check my watchlist", or after /trader-scanner
   and /trader-news, before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m]"
+argument-hint: "[TICKER] [--setup orb|level|vwap|gap] [--interval 5m|1m]"
 ---
 
 # trader-entry
@@ -72,6 +75,30 @@ day bar by bar without waiting.
 - **What it says.** Waiting (and how far the last close is from the level),
   triggered, expired, or no data. Before 9:30: not open yet. Before 9:45: the
   range is still forming. Weekends and NYSE holidays: the market is closed.
+
+## v2.1: the vwap and gap setups
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check NVDA --setup vwap --write
+python3 "${CLAUDE_SKILL_DIR}/entry.py" watch AMD --setup gap
+```
+
+- **vwap**, VWAP reclaim: after 3 or more 5-minute bars in a row closed under
+  the session VWAP, the first bar that closes back above it. Its stop is the
+  lowest low of that run under VWAP; it is skipped when that stop is more
+  than 2 % away.
+- **gap**, gap and go: the stock opened 2 % or more over yesterday's close,
+  the gap has not filled (nothing traded under yesterday's close), and a bar
+  closes above the first 5-minute bar's high. Its stop is that first bar's
+  low. A day with no gap, or a filled gap, says expired: no entry today.
+
+Both are defined once, in `trader-backtest/setups.py`, the file the backtest
+judges, so the entry timer fires on exactly the tested rule. When
+`trader/state/edge.json` has the parameters a backtest picked, they are used.
+A trigger writes `setup_stop`, `setup_target_r` and `params` into
+`trader/entry.json`; `/trader-exit` uses them by default. 5-minute bars only.
+Before calling one of these, check `backtest.py show`: if the setup's verdict
+is NO EDGE, tell the user before they act on the signal.
 
 ## Steps
 
