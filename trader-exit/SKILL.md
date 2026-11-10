@@ -70,6 +70,15 @@ A level setup has no opening range to lean on, so it needs a stop you name.
   win or lose, no overnight hold. On a 1:00 p.m. early close it moves up to
   12:55. An entry at or after the flat-by time is refused.
 
+## v2.1: vwap and gap entries
+
+A `vwap` or `gap` entry from `/trader-entry` carries its own stop
+(`setup_stop`: the swing low under VWAP, or the first bar's low) and the
+backtest's target R. With no `--stop` and no `--target`, the plan uses them:
+`stop_rule` "setup", the exact rule trader-backtest tested. A `--stop` or
+`--target` you give still wins. The plan also keeps the setup's parameters
+(`setup_params`) so the Time Machine replays the same rule's history.
+
 ## Steps
 
 1. Run it right after `/trader-entry` triggers. Before that, `--entry PRICE`

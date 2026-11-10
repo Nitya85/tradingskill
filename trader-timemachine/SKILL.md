@@ -39,9 +39,41 @@ python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol TSLA --date 2026-10-19
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan chart of the saved run
 ```
 
-Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
-bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
-`--now "2026-10-19 10:15"` (New York time) to pin the clock.
+Other flags: `--replays N`, `--seed N` (default 19), `--offline FILE` (a
+saved Yahoo chart JSON, `.json` or `.json.gz`), `--now "2026-10-19 10:15"`
+(New York time) to pin the clock. v2.1 flags: `--method block|iid` (default
+block), `--block N` (bars a run, default 6), `--similar N` (replay from the N
+past days most like today, default 30, 0 = all), `--peers A,B,C` (run the
+same rule's history on other stocks for a bigger sample), `--config` (costs).
+`--window N` is for the iid method only.
+
+## v2.1: the block method (the default) and the verdict from history
+
+The v2.0 replays drew every bar on its own. That throws away how bars follow
+each other (momentum, mean reversion, volatility bursts), so a 1R plan lands
+near a coin flip almost by construction. v2.1 fixes three things:
+
+- **Runs of real bars.** Each replay stitches 6-bar runs (half an hour) cut
+  from real past sessions at the same time of day, so what happens inside a
+  run is what really happened.
+- **Similar days.** The runs come from the 30 past days most like today so
+  far: the closest in how much the stock had moved by the entry bar.
+- **Realistic fills and costs.** A target needs a trade a cent through it,
+  a gap through the stop fills at the bar's open, and spread, slippage and
+  fees (trader/config.json `costs`) come off. Both R before and after costs
+  are printed.
+
+**The verdict now comes from the history, not the replays.** 10,000 replays
+of 59 days are still 59 days of evidence. The verdict line is the plan's own
+rule on every real past session (plus `--peers`), with trader-backtest's
+fill model and costs, judged like trader-backtest judges: "History backs this
+rule (EDGE)", "History says no (NO EDGE)" or "Can't tell yet (NOT ENOUGH
+EVIDENCE)", with the average R after costs and its 95 % range. The replay
+odds follow on the next line as context. With fewer than 30 past triggers it
+says so and suggests `--peers`. The vwap and gap setups get a history too.
+This needs the trader-backtest skill installed next to this one.
+
+`--method iid` runs v2.0 exactly, the reel's numbers below.
 
 ## What it reads and writes
 
@@ -102,9 +134,11 @@ grid). A live in-progress bar is never used.
    is none, run that first, or pass the plan as flags.
 2. Run `timemachine.py run --write`. Add `--until 15:55` when the plan has a
    flat-by time, so "neither" means still open at the time you would get out.
-3. Tell the user, in this order: the four odds, the median and the 5 to 95
-   range of the price at the close, the average R, the history line, then the
-   verdict line and any line under it exactly as printed. Say the seed.
+   Add `--peers` with a few similar liquid stocks when the history is thin.
+3. Tell the user, in this order: the verdict line exactly as printed (it
+   comes from the history after costs), the history line with its 95 %
+   ranges, then the replay odds, the average R before and after costs, and
+   the price range at the close. Say the seed.
 4. If the verdict is a coin flip or close to break-even, say so plainly. Do
    not dress it up. If the history and the replays disagree, say that too.
 5. Say once that this is built from the last 60 days and is not a prediction.
@@ -112,7 +146,20 @@ grid). A live in-progress bar is never used.
    `/trader-news` for the stock before going on.
 6. If the user still wants the trade, hand off to `/trader-budget` to size it.
 
-## Example: the reel
+## Example: the reel, v2.1 (the default)
+
+```
+History, realistic fills after costs: 33 past triggers (33 on TSLA): win rate 42.4 %
+(95 %: 27.2 % to 59.2 %), average -0.170 R (95 %: -0.489 to +0.173).
+History says no (NO EDGE): average -0.170 R a trade after costs over 33 trades: it lost money.
+Replays: target first 36.5 %, stop first 25.1 %, neither 38.4 %; average +0.119 R, +0.066 R after costs.
+```
+
+The replays from similar days look mildly good; the real record of the same
+rule, filled the way it would really have filled, lost money. When they
+disagree, the history wins: it is what happened.
+
+## Example: the reel, v2.0 (`--method iid`)
 
 TSLA, Monday 2026-10-19. The 15-minute opening range is 354.47 to 362.18.
 The 10:10 bar closes above it: entry 364.18 at 10:15 AM (bar 8), stop 358.32

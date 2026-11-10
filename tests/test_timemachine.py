@@ -50,6 +50,9 @@ def plan(**kw):
 
 
 def machine(p=None, text=TEXT, now=NOW_UTC, **kw):
+    # these tests pin the v2.0 reel (each bar drawn alone); the v2.1 block method
+    # has its own tests in test_backtest.py
+    kw.setdefault("method", "iid")
     return tm.time_machine(text, p or plan(), now, **kw)
 
 
@@ -74,6 +77,8 @@ def et(ts):
 
 
 def run(argv):
+    if argv and argv[0] in ("run", "chart") and "--method" not in argv and "--from" not in argv:
+        argv = list(argv) + ["--method", "iid"]
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         code = tm.main(argv)

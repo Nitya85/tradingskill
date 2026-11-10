@@ -19,6 +19,8 @@ Stops (a long's stop rounds DOWN to the cent, away from the entry):
              to the entry bar (--offline FILE or Yahoo). With fewer than 14
              bars by then it averages all of them and says so.
   A level setup has no opening-range default: give a stop.
+  A vwap or gap entry defaults to the setup's own stop (setup_stop in
+  entry.json) and the backtest's target R, the exact rule that was tested.
 
 Targets (round half up to the cent):
   2R (default), 1R, 1.5R ...   entry + R x risk, where risk = entry - stop
@@ -554,7 +556,9 @@ def gather(a):
                 "interval": a.interval or doc.get("interval") or "5m",
                 "or_high": a.or_high if a.or_high is not None else orr.get("high"),
                 "or_low": a.or_low if a.or_low is not None else orr.get("low"),
-                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path}
+                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path,
+                "setup_stop": doc.get("setup_stop"), "setup_target_r": doc.get("setup_target_r"),
+                "params": doc.get("params")}
         if not info["symbol"] or info["entry"] is None:
             raise PlanError("%s has no symbol or price" % path)
     if info["interval"] not in INTERVALS:
@@ -566,13 +570,18 @@ def build_plan(a, now_utc):
     info = gather(a)
     cfg = read_config(a.config)
     stop_text = a.stop
+    target_text = a.target
+    if not stop_text and info.get("setup_stop") and info["setup"] in ("vwap", "gap"):
+        stop_text = "price:%s" % info["setup_stop"]       # the setup's own stop, the one the backtest tested
+        if not target_text and info.get("setup_target_r"):
+            target_text = "%gR" % float(info["setup_target_r"])
     if not stop_text:
         if info["setup"] != "orb":
             raise PlanError("a %s setup has no opening-range stop to default to: give --stop price:X, pct:X or atr:K"
                             % info["setup"])
         stop_text = "or-mid"
     stop_rule, stop_param = parse_stop(stop_text)
-    target_rule, target_param = parse_target(a.target or "2R")
+    target_rule, target_param = parse_target(target_text or "2R")
     day = None
     if info["date"]:
         try:
@@ -605,6 +614,12 @@ def build_plan(a, now_utc):
             "target": float(c["target"]), "target_r": float(c["target_r"]), "target_label": c["target_label"],
             "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": flat_by,
             "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
+    if info.get("setup_stop") and stop_rule == "price" and float(c["stop"]) == float(cents(info["setup_stop"])):
+        plan["stop_rule"] = "setup"
+        if info.get("params"):
+            plan["setup_params"] = info["params"]
+        plan["stop_label"] = {"vwap": "the swing low under VWAP", "gap": "the first bar's low"}.get(
+            info["setup"], "the setup's stop")
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
@@ -626,7 +641,8 @@ def build_plan(a, now_utc):
 
 def describe(plan):
     day = datetime.date.fromisoformat(plan["date"])
-    setup = {"orb": "opening-range breakout", "level": "close above a level"}.get(plan["setup"], plan["setup"])
+    setup = {"orb": "opening-range breakout", "level": "close above a level", "vwap": "VWAP reclaim",
+             "gap": "gap and go"}.get(plan["setup"], plan["setup"])
     e = D(plan["entry"])
     risk = D(plan["risk_per_share"])
     pct = (risk / e * 100).quantize(CENT, rounding=ROUND_HALF_UP)
@@ -701,7 +717,7 @@ def main(argv=None):
     p.add_argument("--or-high", type=float)
     p.add_argument("--or-low", type=float)
     p.add_argument("--or-minutes", type=int, default=15)
-    p.add_argument("--setup", choices=["orb", "level"])
+    p.add_argument("--setup", choices=["orb", "level", "vwap", "gap"])
     p.add_argument("--date", help="session date YYYY-MM-DD (default: the entry's, or today)")
     p.add_argument("--time", help="entry time, e.g. 10:15 AM")
     p.add_argument("--entry-bar", type=int)

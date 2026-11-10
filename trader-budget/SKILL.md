@@ -97,6 +97,16 @@ and the max loss at the stop. Say plainly that a stop is an order, not a
 promise: in a fast market it can fill below the stop. Then hand over to
 `/trader-risk`.
 
+## v2.1: costs in the size
+
+When `trader/config.json` has `costs` (the example config does), the max-loss
+limit divides by the risk a share PLUS the estimated costs: the spread and
+slippage on the entry and on the stop's market sell, plus fees (the same model
+trader-backtest and trader-risk use). The report shows the max loss at the
+stop with and without them. For the reel: $50 / (5.86 + 0.37) = 8 shares,
+$49.86 at the stop with costs. Without `costs` the tool says the real loss is
+a little bigger than shown.
+
 ## Example: the reel
 
 TSLA on Monday 2026-10-19. Opening-range breakout: entry 364.18 at 10:15 AM,

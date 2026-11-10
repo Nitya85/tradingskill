@@ -14,7 +14,27 @@ session in the data.
     python3 timemachine.py chart                        # ASCII fan chart of the replays
     python3 timemachine.py chart --from trader/timemachine.json
 
-How the replays work (the reel's sim.py, same algorithm, same random draws):
+Two ways to replay (--method):
+
+  block (the default, v2.1): each replay stitches together RUNS of --block
+  bars (default 6, half an hour) cut from real past sessions at the same time
+  of day, so momentum, mean reversion and volatility bursts inside a run
+  survive. The sessions it cuts from are the --similar (default 30) past days
+  most like today so far: the closest in how much the stock had moved by the
+  entry bar. Fills are realistic: a target needs a trade a cent through it,
+  a gap through the stop fills at the bar's open, and spread, slippage and
+  fees come out of every trade (trader/config.json "costs", the same model
+  as trader-backtest). Next to it, the HISTORY of the same rule on real past
+  sessions (and on --peers stocks, for a bigger sample), after costs, with a
+  95 % range. The verdict comes from that history, because 10,000 replays of
+  59 days are still only 59 days of evidence.
+
+  iid (v2.0, the reel): every bar drawn on its own, as below. Kept so the
+  reel's numbers still reproduce (--method iid). Drawing bars one at a time
+  throws away the way bars follow each other, so on a 1R target it lands
+  near a coin flip almost by construction.
+
+How the iid replays work (the reel's sim.py, same algorithm, same random draws):
   1. Fetch 60 days of 5-minute bars (Yahoo v8 chart, range=60d interval=5m;
      one request). Keep only FULL sessions before the plan's date: 78 bars,
      9:30 to 4:00 New York time. Half days, gaps and today are left out.
@@ -106,6 +126,31 @@ EARLY_MIN = 13 * 60
 
 class TMError(Exception):
     pass
+
+
+BLOCK = 6
+SIMILAR = 30
+MIN_ANALOGS = 30
+BT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-backtest")
+_MODS = {}
+
+
+def backtest_module(name):
+    """trader-backtest/<name>.py (setups, backtest, marketdata), or None when the
+    trader-backtest skill is not installed next to this one."""
+    if name not in _MODS:
+        path = os.path.join(BT_DIR, name + ".py")
+        if not os.path.exists(path):
+            _MODS[name] = None
+        else:
+            if BT_DIR not in sys.path:
+                sys.path.insert(0, BT_DIR)
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("trader_bt_" + name, path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _MODS[name] = mod
+    return _MODS[name]
 
 
 # ---------------------------------------------------------------- time (copied from trader-alerts)
@@ -424,6 +469,193 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
     }
 
 
+# ---------------------------------------------------------------- block replays (v2.1)
+
+def move_so_far(D, k):
+    """How much a session had moved by bar k: the first bar's range plus the sum of
+    |log returns| close to close. Used to find the past days most like today."""
+    x = (D[0]["h"] - D[0]["l"]) / D[0]["o"] if D[0]["o"] else 0.0
+    for i in range(1, k + 1):
+        if D[i - 1]["c"] > 0 and D[i]["c"] > 0:
+            x += abs(math.log(D[i]["c"] / D[i - 1]["c"]))
+    return x
+
+
+def similar_sessions(sessions, entry_day, k, n):
+    """The n past sessions closest to today in move_so_far, or all of them when
+    today's bars up to k are not all there or n is 0."""
+    if not n or n >= len(sessions) or not all(i in entry_day for i in range(k + 1)):
+        return sessions, None
+    today = move_so_far([entry_day[i] for i in range(k + 1)], k)
+    if today <= 0:
+        return sessions, None
+    scored = sorted(sessions, key=lambda s: abs(math.log(max(move_so_far(s[1], k), 1e-9) / today)))
+    return sorted(scored[:n]), round(today * 100, 3)
+
+
+def _ratios(D):
+    out = [None]
+    for i in range(1, SESSION_BARS):
+        pc = D[i - 1]["c"]
+        out.append((D[i]["o"] / pc, D[i]["h"] / pc, D[i]["l"] / pc, D[i]["c"] / pc))
+    return out
+
+
+def simulate_block(sessions, entry, stop, target, k, last, replays=10000, seed=19, block=BLOCK,
+                   side="buy", costs=None):
+    """Monte Carlo replays of bars k+1..last, stitched from runs of `block` bars of
+    real sessions. Costs (setups.py's model) come off avg_R_net."""
+    long = side == "buy"
+    risk = (entry - stop) if long else (stop - entry)
+    r_target = round(((target - entry) if long else (entry - target)) / risk, 4)
+    st = backtest_module("setups")
+    cz = costs if (costs is not None and st) else None
+    pools = [_ratios(D) for _, D in sessions]
+    tick = 0.01
+
+    def walk(rng, record):
+        p = entry
+        outcome = raw_out = None
+        path = [entry] if record else None
+        left, src = 0, None
+        for i in range(k + 1, last + 1):
+            if left == 0:
+                src = pools[rng.randrange(len(pools))]
+                left = block
+            o, h, l, c = src[i]
+            left -= 1
+            op, hi, lo, cl = p * o, p * h, p * l, p * c
+            if outcome is None:
+                if long:
+                    if lo <= stop:
+                        outcome, raw_out = "stop", min(stop, op)
+                    elif hi >= target + tick - 1e-9:
+                        outcome, raw_out = "target", max(target, op)
+                else:
+                    if hi >= stop:
+                        outcome, raw_out = "stop", max(stop, op)
+                    elif lo <= target - tick + 1e-9:
+                        outcome, raw_out = "target", min(target, op)
+            p = cl
+            if record:
+                path.append(p)
+        return outcome or "close", (raw_out if outcome else p), p, path
+
+    rng = random.Random(seed)
+    outcomes, closes, paths, Rs, Rn = [], [], [], [], []
+    for n in range(replays):
+        oc, out_px, close_px, path = walk(rng, n < SAMPLE_PATHS)
+        outcomes.append(oc)
+        closes.append(close_px)
+        if path:
+            paths.append([round(x, 2) for x in path])
+        g = ((out_px - entry) if long else (entry - out_px)) / risk
+        Rs.append(g)
+        if cz:
+            paid = st.buy_fill(entry, cz) if long else st.sell_fill(entry, cz)
+            got = out_px if oc == "target" else (st.sell_fill(out_px, cz) if long else st.buy_fill(out_px, cz))
+            fees = got * cz["sell_fee_bps"] / 10000.0 + 2 * cz["commission_per_share"]
+            Rn.append(((got - paid) if long else (paid - got)) / risk - fees / risk)
+    cnt = {x: outcomes.count(x) for x in ("target", "stop", "close")}
+    green = sum(1 for o, p in zip(outcomes, closes)
+                if o == "target" or (o == "close" and (p > entry if long else p < entry)))
+    srt = sorted(closes)
+    rng = random.Random(seed + 1)
+    allp = [walk(rng, True)[3] for _ in range(BAND_PATHS)]
+    bands = []
+    for j in range(last - k + 1):
+        col = sorted(pp[j] for pp in allp)
+        bands.append([round(pct(col, q), 2) for q in BAND_Q])
+    lo_, hi_ = pct(srt, 0.01), pct(srt, 0.99)
+    W = (hi_ - lo_) / HIST_BINS
+    bins = [0] * HIST_BINS
+    for c in srt:
+        b = int((c - lo_) / W) if W > 0 else 0
+        if 0 <= b < HIST_BINS:
+            bins[b] += 1
+    return {
+        "method": "block", "block": block, "replays": replays, "seed": seed, "window": 0, "bars_left": last - k,
+        "p_target": round(cnt["target"] / replays, 4), "p_stop": round(cnt["stop"] / replays, 4),
+        "p_neither": round(cnt["close"] / replays, 4), "p_green": round(green / replays, 4),
+        "median_close": round(pct(srt, 0.5), 2), "p5_close": round(pct(srt, 0.05), 2),
+        "p95_close": round(pct(srt, 0.95), 2), "avg_R": round(statistics.mean(Rs), 3),
+        "avg_R_net": round(statistics.mean(Rn), 3) if Rn else None,
+        "r_at_target": r_target, "band_paths": BAND_PATHS, "bands": bands, "sample_paths": paths,
+        "hist": {"lo": round(lo_, 2), "hi": round(hi_, 2), "bins": bins},
+    }
+
+
+def analog_params(plan, rule):
+    """The setups.py parameters for the plan's own rule."""
+    setup = plan["setup"].lower()
+    p = dict(plan.get("setup_params") or {})
+    p["target_r"] = plan["target_r"]
+    if setup == "orb" and rule:
+        p["or_minutes"] = rule["or_minutes"]
+        p["stop_rule"] = rule["stop_rule"] if rule["stop_rule"] in ("or_mid", "or_low") else "pct"
+        if p["stop_rule"] == "pct":
+            p["stop_pct"] = rule.get("stop_pct") or round(100.0 * plan["risk_per_share"] / plan["entry"], 4)
+    return p
+
+
+def analog_history(sessions, plan, rule, last, costs, peers=None):
+    """The plan's rule on every past session (and every --peers session) with the
+    realistic fill model and costs: the evidence the verdict rests on."""
+    st, bt = backtest_module("setups"), backtest_module("backtest")
+    setup = plan["setup"].lower()
+    if not st or not bt or plan["side"] != "buy" or setup not in st.SETUPS:
+        why = ("install trader-backtest next to this skill" if not st or not bt else
+               "longs only" if plan["side"] != "buy" else "the setup %r is not one of %s" % (setup, ", ".join(st.SETUPS)))
+        return {"skipped": why}
+    try:
+        params = st.params_for(setup, analog_params(plan, rule))
+    except st.SetupError as e:
+        return {"skipped": str(e)}
+    flat = min(last, st.flat_slot(plan.get("flat_by") or "15:55"))
+    first, cut = st.entry_window()
+    window = (first, min(cut, flat - 1))
+    data = {plan["symbol"]: []}
+    prev = None
+    for d, D in sessions:
+        data[plan["symbol"]].append((d, D, prev))
+        prev = D[-1]["c"]
+    for sym, ss in (peers or {}).items():
+        if sym != plan["symbol"]:
+            data[sym] = ss
+    trades = bt.trades_for(setup, params, data, costs, window, flat)
+    s = bt.stats(trades)
+    own = [t for t in trades if t["symbol"] == plan["symbol"]]
+    return {"params": params, "stats": s, "own_trades": len(own), "peer_trades": len(trades) - len(own),
+            "peers": sorted(x for x in data if x != plan["symbol"]),
+            "trades": [{k: t[k] for k in ("symbol", "date", "time", "outcome", "R")} for t in trades[:400]]}
+
+
+def honest_verdict(mc, an):
+    """The verdict from the history after costs; the replays are context."""
+    bt = backtest_module("backtest")
+    s = (an or {}).get("stats") or {}
+    if not s.get("trades") or not bt:
+        head = ("No history for this rule (%s): nothing here is evidence of an edge."
+                % ((an or {}).get("skipped") or "it never fired"))
+    else:
+        v, why = bt.verdict(s)
+        label = {"EDGE": "History backs this rule", "NO EDGE": "History says no",
+                 "NOT ENOUGH EVIDENCE": "Can't tell yet"}[v]
+        src = "%d on this stock" % an["own_trades"]
+        if an["peer_trades"]:
+            src += " and %d on %d peer stock%s" % (an["peer_trades"], len(an["peers"]), "" if len(an["peers"]) == 1 else "s")
+        head = "%s (%s): %s. Past triggers: %s." % (label, v, why, src)
+    notes = []
+    net = mc.get("avg_R_net")
+    notes.append("Replays: target first %s, stop first %s, neither %s; average %+.3f R%s."
+                 % (pc(mc["p_target"]), pc(mc["p_stop"]), pc(mc["p_neither"]), mc["avg_R"],
+                    (", %+.3f R after costs" % net) if net is not None else ""))
+    if s.get("trades", 0) < MIN_ANALOGS:
+        notes.append("Fewer than %d past triggers: add --peers (other stocks, same rule) for a bigger sample."
+                     % MIN_ANALOGS)
+    return head, notes
+
+
 # ---------------------------------------------------------------- stop rules and the history replay
 
 def cents_away(x, long):
@@ -588,6 +820,7 @@ def normalize_plan(raw, src="flags"):
         "opening_range": dict(orng, minutes=or_min) if isinstance(orng, dict) else {"minutes": or_min},
         "stop_rule": str(raw.get("stop_rule") or "auto"), "interval": "5m",
         "flat_by": raw.get("flat_by"), "from": src,
+        "setup_params": raw.get("setup_params") if isinstance(raw.get("setup_params"), dict) else None,
     }
 
 
@@ -676,12 +909,17 @@ def verdict_notes(mc):
     return notes
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo",
+                 method="block", block=BLOCK, similar=SIMILAR, costs=None, peers=None):
     """Chart JSON text + a normalized plan -> the timemachine.json document."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
     if not 0 <= window <= 10:
         raise TMError("--window must be between 0 and 10 bars")
+    if method not in ("block", "iid"):
+        raise TMError("--method is block or iid")
+    if not 1 <= block <= 39:
+        raise TMError("--block must be between 1 and 39 bars")
     sym = plan["symbol"]
     result = chart_result(text, sym)
     meta, bars, dropped = parse_bars(result, now_utc)
@@ -720,10 +958,20 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     if len(sessions) < MIN_SESSIONS:
         raise TMError("only %d full session(s) of %s before %s in the data; the time machine needs at least %d"
                       % (len(sessions), sym, plan["date"], MIN_SESSIONS))
-    pool = build_pool(sessions)
-    mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"])
-    mc = dict(mc, until=clock24(until_min), pool_sessions=len(sessions), pool_from=sessions[0][0],
-              pool_to=sessions[-1][0],
+    if method == "iid":
+        pool = build_pool(sessions)
+        mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"])
+        mc["method"] = "iid"
+        used, today_move = sessions, None
+    else:
+        st = backtest_module("setups")
+        if costs is None and st:
+            costs = st.costs_for(None)
+        used, today_move = similar_sessions(sessions, entry_day, k, similar)
+        mc = simulate_block(used, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, block,
+                            plan["side"], costs)
+    mc = dict(mc, until=clock24(until_min), pool_sessions=len(used), pool_from=used[0][0],
+              pool_to=used[-1][0], all_sessions=len(sessions), today_move_pct=today_move,
               band_times=[clock24(OPEN_MIN + 5 * (j + 1)) for j in range(k, last + 1)])
     rule = resolve_rule(plan, entry_day)
     plan_out = {kk: v for kk, v in plan.items() if v is not None}
@@ -735,7 +983,13 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
                            "this plan's setup is %r" % plan["setup"]}
     last_bar = bars[-1]
-    return {
+    analog = None
+    if method == "block":
+        analog = analog_history(sessions, plan, rule, last, costs, peers)
+        v, vnotes = honest_verdict(mc, analog)
+    else:
+        v, vnotes = verdict(mc), verdict_notes(mc)
+    doc = {
         "created_by": "trader-timemachine",
         "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": source,
@@ -745,12 +999,16 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "plan": plan_out,
         "mc": mc,
         "history": history,
-        "verdict": verdict(mc),
-        "verdict_notes": verdict_notes(mc),
+        "verdict": v,
+        "verdict_notes": vnotes,
         "warnings": warn,
         "note": ("A simulation built from %s's own last %d full sessions. It is not a prediction: earnings, "
                  "news and halts can do things those sessions never did. Same seed, same numbers." % (sym, len(sessions))),
     }
+    if analog is not None:
+        doc["analog"] = analog
+        doc["costs"] = costs
+    return doc
 
 
 # ---------------------------------------------------------------- output
@@ -771,8 +1029,17 @@ def report(doc):
            p["target"], ("%g" % r), p["risk_per_share"]),
         "%s replays of the rest of the session, %s to %s (%d five-minute bars), seed %d."
         % ("{:,}".format(m["replays"]), p["entry_time"], until, m["bars_left"], m["seed"]),
-        "Each bar is drawn whole from %s's own 5-min bars at the same time of day (+-%d bars) over its last "
-        "%d full sessions (%s to %s)." % (p["symbol"], m["window"], m["pool_sessions"], m["pool_from"], m["pool_to"]),
+    ]
+    if m.get("method") == "block":
+        lines.append("Each replay stitches %d-bar runs (%d minutes) cut from %s's own sessions at the same time of day: "
+                     "the %d of its last %d full sessions most like today by the entry bar (%s to %s)."
+                     % (m["block"], 5 * m["block"], p["symbol"], m["pool_sessions"], m.get("all_sessions", m["pool_sessions"]),
+                        m["pool_from"], m["pool_to"]))
+    else:
+        lines.append("Each bar is drawn whole from %s's own 5-min bars at the same time of day (+-%d bars) over its last "
+                     "%d full sessions (%s to %s)." % (p["symbol"], m["window"], m["pool_sessions"], m["pool_from"],
+                                                      m["pool_to"]))
+    lines += [
         "",
         "  target first   %s" % pc(m["p_target"]),
         "  stop first     %s" % pc(m["p_stop"]),
@@ -782,10 +1049,31 @@ def report(doc):
         "",
         "  Price at %s: median %.2f, 90 %% of replays between %.2f and %.2f."
         % (until, m["median_close"], m["p5_close"], m["p95_close"]),
-        "  Average R: %+.3f (R = the %.2f risk: %sR at the target, -1R at the stop)."
-        % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]), ),
+        "  Average R: %+.3f (R = the %.2f risk: %sR at the target, -1R at the stop)%s."
+        % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]),
+           ("; %+.3f R after spread, slippage and fees" % m["avg_R_net"]) if m.get("avg_R_net") is not None else ""),
         "",
     ]
+    an = doc.get("analog")
+    if an is not None:
+        s = an.get("stats") or {}
+        if an.get("skipped"):
+            lines.append("History (realistic fills, after costs): skipped, %s." % an["skipped"])
+        elif not s.get("trades"):
+            lines.append("History (realistic fills, after costs): the rule never fired.")
+        else:
+            rng = s.get("avg_R_95") or [0, 0]
+            lines.append("History, realistic fills after costs: %d past trigger%s (%d on %s%s): win rate %s "
+                         "(95 %%: %s to %s), average %+.3f R (95 %%: %+.3f to %+.3f)."
+                         % (s["trades"], "" if s["trades"] == 1 else "s", an["own_trades"], p["symbol"],
+                            (", %d on peers" % an["peer_trades"]) if an["peer_trades"] else "",
+                            pc(s["win_rate"]), pc(s["win_rate_95"][0]), pc(s["win_rate_95"][1]),
+                            s["avg_R"], rng[0], rng[1]))
+        lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or []) + [""]
+        for w in doc.get("warnings") or []:
+            lines.append("Note: " + w + ".")
+        lines.append(doc["note"] + " Repeat this run with --seed %d." % m["seed"])
+        return lines
     if h.get("rule"):
         ru = h["rule"]
         stop_words = {"or_mid": "opening-range midpoint", "or_low": "opening-range low",
@@ -874,7 +1162,45 @@ def compute(a):
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
+    costs, peers = None, None
+    if a.method == "block":
+        st = backtest_module("setups")
+        if st:
+            cfg = {}
+            if a.config and os.path.exists(a.config):
+                try:
+                    with open(a.config, encoding="utf-8") as fh:
+                        cfg = json.load(fh)
+                except ValueError:
+                    raise TMError("%s is not valid JSON" % a.config)
+            costs = st.costs_for(cfg.get("costs"))
+        if a.peers:
+            peers = load_peers([x.strip().upper() for x in a.peers.split(",") if x.strip()], a.peers_offline,
+                               plan["date"], now)
+    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, a.method, a.block,
+                        a.similar, costs, peers)
+
+
+def load_peers(tickers, offline, before, now):
+    """Other stocks' full sessions before the plan's day, checked by marketdata.qa."""
+    md = backtest_module("marketdata")
+    if not md:
+        raise TMError("--peers needs the trader-backtest skill installed next to this one")
+    out = {}
+    for sym in tickers:
+        try:
+            text, _ = md.load_chart(sym, offline)
+            bars, counts = md.parse(text, sym, now)
+        except md.DataError as e:
+            print("timemachine.py: peer %s left out: %s" % (sym, e), file=sys.stderr)
+            continue
+        full, _ = md.sessions_of(bars)
+        kept, rep = md.qa(sym, [x for x in full if x[0] < before], counts)
+        if rep["exclude"]:
+            print("timemachine.py: peer %s left out: %s" % (sym, rep["exclude"]), file=sys.stderr)
+            continue
+        out[sym] = kept
+    return out
 
 
 def cmd_run(a):
@@ -930,6 +1256,15 @@ def main(argv=None):
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
         p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
+        p.add_argument("--method", default="block", choices=["block", "iid"],
+                       help="block: runs of real bars from similar days, costs, history verdict (default); "
+                            "iid: v2.0, each bar drawn alone (the reel's numbers)")
+        p.add_argument("--block", type=int, default=BLOCK, help="bars a run (block method, default 6)")
+        p.add_argument("--similar", type=int, default=SIMILAR,
+                       help="replay from the N past days most like today so far (0 = all; default 30)")
+        p.add_argument("--peers", help="other tickers to run the same rule on, for a bigger history")
+        p.add_argument("--peers-offline", metavar="DIR", help="a folder of <SYM>-60d5m.json(.gz) for --peers")
+        p.add_argument("--config", default="trader/config.json", help="costs come from here")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")

@@ -16,6 +16,15 @@ Setups (v2 plans longs only):
          above the range high. A wick above the high is not a trigger.
   level  the first completed bar that closes above --level (for example a
          20-day high from trader-scanner).
+  vwap   VWAP reclaim: after 3 or more bars in a row closed under the
+         session VWAP, the first bar that closes back above it.
+  gap    gap and go: opened 2 %+ over yesterday's close, the gap has not
+         filled, and a bar closes above the first 5-minute bar's high.
+  vwap and gap are defined in trader-backtest/setups.py, the same file the
+  backtest judges, so the entry timer fires on exactly the tested rule. When
+  trader/state/edge.json holds a backtest's parameters for the setup, they
+  are used. They also suggest the setup's own stop (setup_stop in
+  entry.json), which trader-exit uses by default. 5-minute bars only.
   --min-volume-x X  the trigger bar also needs at least X times the average
          volume of the opening-range bars (the 9:30 bar carries the opening
          auction, so 1.0 is already a high bar).
@@ -53,6 +62,7 @@ trigger, 1 otherwise. watchlist 0 when at least one symbol triggered.
 import argparse
 import datetime
 import gzip
+import importlib.util
 import json
 import os
 import re
@@ -106,6 +116,33 @@ EARLY = datetime.time(13, 0)
 
 class EntryError(Exception):
     pass
+
+
+SETUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-backtest", "setups.py")
+_SETUPS = []
+
+
+def setups_module():
+    """trader-backtest/setups.py, loaded once: the single definition of vwap and gap."""
+    if not _SETUPS:
+        if not os.path.exists(SETUP_FILE):
+            raise EntryError("the vwap and gap setups live in trader-backtest/setups.py: install the "
+                             "trader-backtest skill next to trader-entry")
+        spec = importlib.util.spec_from_file_location("trader_setups", SETUP_FILE)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _SETUPS.append(mod)
+    return _SETUPS[0]
+
+
+def edge_params(setup, path="trader/state/edge.json"):
+    """The parameters a backtest picked for this setup, if trader/state/edge.json has them."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            p = (json.load(fh).get("setups") or {}).get(setup, {}).get("params")
+        return p if isinstance(p, dict) else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 # ---------------------------------------------------------------- time
@@ -406,7 +443,7 @@ def early_cutoff(day, t, close_dt):
 
 
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
-             min_volume_x=None, cfg=None):
+             min_volume_x=None, cfg=None, params=None):
     """Pure function: the setup's status at now_utc from one session's bars."""
     cfg = cfg or dict(DEFAULTS)
     if interval not in INTERVALS:
@@ -414,8 +451,10 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     step = INTERVALS[interval]
     if or_minutes <= 0 or (or_minutes * 60) % step:
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
-    if setup not in ("orb", "level"):
-        raise EntryError("--setup is orb or level")
+    if setup not in ("orb", "level", "vwap", "gap"):
+        raise EntryError("--setup is orb, level, vwap or gap")
+    if setup in ("vwap", "gap") and interval != "5m":
+        raise EntryError("the %s setup is defined on 5-minute bars (--interval 5m)" % setup)
     if setup == "level" and level is None:
         raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
     n_or = or_minutes * 60 // step
@@ -478,6 +517,10 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         res.update(phase="pre-open", reason="the NYSE opens at 9:30%s" % (
             " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
         return res
+
+    if setup in ("vwap", "gap"):
+        return _evaluate_setup(res, chart, bars, pending, setup, params, min_volume_x, local, day, open_dt,
+                               close_dt, before, cutoff, early)
 
     or_bars = [b for b in bars if b["slot"] < n_or]
     avg_vol = (sum(b["v"] for b in or_bars) / float(len(or_bars))) if or_bars else None
@@ -552,6 +595,94 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     return res
 
 
+def _prev_close(chart, day, open_dt):
+    """Yesterday's regular-session close from the chart's own bars when it holds
+    earlier days (an offline 60-day file), else Yahoo's previousClose."""
+    best = None
+    for b in chart["bars"]:
+        et = to_eastern(utc_of(b["t"]))
+        if et.date() < day and datetime.time(9, 30) <= et.time() < datetime.time(16, 0):
+            if best is None or b["t"] > best[0]:
+                best = (b["t"], b["c"])
+    return best[1] if best else chart.get("prev_close")
+
+
+def _evaluate_setup(res, chart, bars, pending, setup, params, min_volume_x, local, day, open_dt, close_dt,
+                    before, cutoff, early):
+    """vwap and gap through trader-backtest/setups.py."""
+    st = setups_module()
+    p = dict(params or {})
+    if min_volume_x:
+        p["min_volume_x"] = min_volume_x
+    try:
+        p = st.params_for(setup, p)
+    except st.SetupError as e:
+        raise EntryError(str(e))
+    res["params"] = p
+    seq = []
+    for b in sorted(bars, key=lambda x: x["slot"]):
+        if b["slot"] != len(seq):
+            res["data_note"] = "Yahoo is missing the %s bar: the setup reads the bars before it only" % (
+                hm(open_dt + datetime.timedelta(minutes=5 * len(seq))))
+            break
+        seq.append(b)
+    prev = _prev_close(chart, day, open_dt)
+    res["prev_close"] = r2(prev) if prev else None
+    window = st.entry_window(hm(before), hm(cutoff))
+    sig = st.signal(setup, seq, prev, p, window) if seq else None
+    if sig:
+        trig = seq[sig["index"]]
+        res["level"] = r2(sig["level"])
+        res.update(status="triggered", phase="open" if local < close_dt else "after-close", reason=sig["why"])
+        res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
+                          "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
+                          "volume": trig["v"], "volume_x": None,
+                          "pct_over": r2(100.0 * (trig["c"] / sig["level"] - 1))}
+        res["setup_stop"] = sig["stop"]
+        res["setup_target_r"] = sig["target_r"]
+        res["setup_why"] = sig["why"]
+        res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
+        res["last"] = {"bar_start": hm(seq[-1]["et"]), "close": r2(seq[-1]["c"]),
+                       "vs_level_pct": r2(100.0 * (seq[-1]["c"] / sig["level"] - 1))}
+        return res
+    if not seq:
+        res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
+        return res
+    last = seq[-1]
+    if setup == "gap":
+        if not prev:
+            res.update(status="no-data", phase="open", reason="no previous close to measure the gap from")
+            return res
+        gap = 100.0 * (seq[0]["o"] / prev - 1)
+        res["gap_pct"] = r2(gap)
+        if gap < p["min_gap_pct"]:
+            res.update(status="expired", phase="open", reason="opened %+.2f%% from yesterday's close $%.2f, under the "
+                       "%.1f%% gap this setup needs" % (gap, prev, p["min_gap_pct"]))
+            return res
+        if any(b["l"] < prev for b in seq):
+            res.update(status="expired", phase="open", reason="the %.2f%% gap filled (traded under $%.2f)" % (gap, prev))
+            return res
+        n = int(p["range_bars"])
+        lvl = max(b["h"] for b in seq[:n])
+        res["level"] = r2(lvl)
+        what = "gapped %+.2f%%, waiting for a close above the first %d-minute high $%.2f" % (gap, 5 * n, lvl)
+    else:
+        vw = st.vwap_series(seq)[-1]
+        res["vwap"] = r2(vw) if vw else None
+        res["level"] = res["vwap"]
+        what = ("last close $%.2f is %s VWAP $%.2f; it triggers on the first close back above after %d+ bars under"
+                % (last["c"], "under" if vw and last["c"] < vw else "over", vw or 0, p["min_below"]))
+    res["last"] = {"bar_start": hm(last["et"]), "close": r2(last["c"]),
+                   "vs_level_pct": r2(100.0 * (last["c"] / res["level"] - 1)) if res.get("level") else None}
+    if local >= cutoff and not (pending and pending["end"] <= cutoff):
+        res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
+                   reason="no trigger by %s, the last time for a new entry%s" % (
+                       short(cutoff), " (1:00 p.m. early close today)" if early else ""))
+        return res
+    res.update(phase="open", reason=what)
+    return res
+
+
 def public(res):
     """The result without the internal bar list, ready for JSON."""
     return {k: v for k, v in res.items() if not k.startswith("_")}
@@ -561,12 +692,17 @@ def entry_doc(res, now_utc):
     """trader/entry.json, the contract shape (plus a plain-words reason)."""
     t = res.get("trigger") or {}
     orr = res.get("opening_range")
-    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
+    doc = {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
             "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
             "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+    if res.get("setup_stop") is not None:
+        doc["setup_stop"] = res["setup_stop"]
+        doc["setup_target_r"] = res.get("setup_target_r")
+        doc["params"] = res.get("params")
+    return doc
 
 
 def write_json(path, doc):
@@ -586,6 +722,10 @@ SHORT = {"pre-open": "not open", "forming": "forming", "closed": "closed"}
 
 
 def setup_name(res):
+    if res["setup"] == "vwap":
+        return "VWAP reclaim"
+    if res["setup"] == "gap":
+        return "gap and go"
     if res["setup"] == "orb":
         return "opening-range breakout (%d-minute range)" % res["or_minutes"]
     return "close above $%.2f" % res["level"] if res["level"] is not None else "close above a level"
@@ -609,11 +749,16 @@ def describe(res):
             "" if orr["complete"] else ", still forming"))
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
-    if t:
+    if t and res.get("setup_why"):
+        out.append("TRIGGERED %s at $%.2f: the %s bar (bar %d) %s. Setup stop $%.2f." % (
+            t["time"], t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
+            res["setup_why"], res["setup_stop"]))
+    if t and not res.get("setup_why"):
         out.append("TRIGGERED %s at $%.2f: the %s bar (bar %d) closed above %s $%.2f (%+.2f%%%s)." % (
             t["time"], t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
             "the range high" if res["setup"] == "orb" else "the level", res["level"], t["pct_over"],
             (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+    if t:
         step = INTERVALS[res["interval"]] // 60
         if res.get("minutes_since", 0) > step and res.get("last"):
             out.append("That was %d minutes ago; the last close is $%.2f (%s bar). A late entry is a different "
@@ -662,6 +807,8 @@ def bar_line(b, res):
     elif t and t["bar_index"] == b["slot"]:
         note = "TRIGGERED: closed above $%.2f (%+.2f%%). Get in now if you take it: %s, $%.2f" % (
             lvl, t["pct_over"], t["time"], t["price"])
+    elif res["setup"] in ("vwap", "gap"):
+        note = res.get("reason", "") if b is (res["_bars"] or [None])[-1] else ""
     elif lvl is None:
         note = ""
     elif b["c"] > lvl:
@@ -790,8 +937,11 @@ def _opts(a, cfg):
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
+    params = None
+    if a.setup in ("vwap", "gap"):
+        params = edge_params(a.setup, getattr(a, "edge", "trader/state/edge.json"))
     return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
-            "min_volume_x": a.min_volume_x, "cfg": cfg}
+            "min_volume_x": a.min_volume_x, "cfg": cfg, "params": params}
 
 
 def _load(a, sym, now):
@@ -916,7 +1066,9 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def common(p):
-        p.add_argument("--setup", choices=["orb", "level"], default="orb")
+        p.add_argument("--setup", choices=["orb", "level", "vwap", "gap"], default="orb")
+        p.add_argument("--edge", default="trader/state/edge.json",
+                       help="vwap/gap use the parameters a backtest saved here, if any")
         p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")

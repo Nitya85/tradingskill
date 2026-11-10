@@ -25,6 +25,10 @@ CONTRACT_CFG = {
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "fractional": False, "broker": "alpaca", "paper": True, "blocked": [],
     "allow_options": False, "allow_margin": False, "allow_short": False, "pdt_guard": False,
+    "require_edge": "live", "edge_max_age_days": 7,
+    "costs": {"spread_bps": 4.0, "min_spread_cents": 1.0, "slippage_bps": 3.0, "commission_per_share": 0.0,
+              "sell_fee_bps": 0.3},
+    "min_price": 5.0, "min_dollar_volume": 20000000,
     "sec_user_agent": "Your Name you@example.com",
 }
 # v1's rules, for the weights mode tests
@@ -33,8 +37,10 @@ V1 = {"budget": 5000, "cash_buffer_pct": 10, "max_position_pct": 25, "max_order_
 
 
 def cfg(**over):
+    # the reel's numbers (v2.0) have no costs in them; costs have their own tests (test_backtest.py)
     with open(CFG) as fh:
         c = json.load(fh)
+    c.pop("costs", None)
     c.update(over)
     return c
 
@@ -190,7 +196,8 @@ class PlanRules(unittest.TestCase):
             base = ["--plan", PLAN, "--config", CFG, "--portfolio", os.path.join(d, "none"), "--prices", pp, "--json"]
             code, text, _ = run(base + ["--now", "2026-10-19 10:55"])
             out = json.loads(text)
-            self.assertEqual((code, out["sizing"]["qty"], out["orders"]), (1, 6, []))
+            # the shipped config counts costs: $50 / (8.16 risk + 0.37 costs) = 5 shares (6 without costs)
+            self.assertEqual((code, out["sizing"]["qty"], out["orders"]), (1, 5, []))
             self.assertIn("above the plan's entry", out["notes"][0])
             out = json.loads(run(base + ["--now", "2026-10-19 11:30"])[1])
             self.assertEqual(out["sizing"]["qty"], 8)

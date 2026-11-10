@@ -1,6 +1,6 @@
 # The Day Trader skill
 
-11 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar.
+12 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, replay every outcome, and prove an edge after costs before you risk a dollar.
 
 Free, MIT, no signup, no API key. The tools are plain Python that read free
 public data: Yahoo Finance charts, Nasdaq Trader's symbol lists, SEC EDGAR
@@ -15,6 +15,41 @@ past day the same setup fired, and tells you the honest odds.
 
 And no trade goes through until you say yes. Nothing in this pack can place
 an order on its own. Paper trading is the default.
+
+## What's new in v2.1: honest measurement
+
+v2.0 could time, size and check a trade, but it could not tell you whether a
+setup was worth trading. v2.1 adds the part that matters most, and makes the
+rest of the pack use it:
+
+- **`/trader-backtest`**, the twelfth skill. Runs a setup across a whole
+  universe of liquid stocks, tunes it on the older days and judges it only
+  on the newer ones (walk-forward), and says **EDGE**, **NO EDGE** or **NOT
+  ENOUGH EVIDENCE** from a 95 % range that resamples whole days, not single
+  trades.
+- **Realistic fills and costs everywhere.** In at the next bar's open (not
+  the close you just saw), stops filled through gaps, targets only when
+  traded through, and spread, slippage and fees on every fill. One cost model
+  (`trader-backtest/setups.py`) used by the backtest, the Time Machine, the
+  Budget Manager and the Risk Manager.
+- **A Time Machine that keeps how bars follow each other.** Replays stitch
+  half-hour runs of real bars from the past days most like today, instead of
+  drawing every bar alone, and the verdict now comes from the real history of
+  the same rule after costs (`--method iid` still runs v2.0).
+- **A proven-edge gate.** `/trader-risk` blocks live entries on a setup
+  without a fresh EDGE verdict (and warns on paper, where a setup earns its
+  evidence).
+- **Two new setups**, VWAP reclaim and gap and go, defined once and shared
+  by the backtest and the entry timer, so the timer fires on exactly the rule
+  that was tested (checked day by day in the tests).
+- **Data checks** before anything trusts the data: impossible bars, outlier
+  bars, splits, stale data, thin and cheap stocks, an optional Stooq
+  cross-check.
+
+What none of it can do is make day trading reliably profitable. On the reel's
+own TSLA data, the opening-range breakout lost money once it was filled
+realistically and costs came out. The point of v2.1 is to find that out on
+paper, for free, before a live account does.
 
 > **Looking for the original Trader skill?** Copy an investor's 13F, the
 > stock screener, tax lots and rebalancing live in
@@ -57,7 +92,7 @@ The tools need Python 3.8 or newer. Nothing to pip install. The SEC tools
 email in `trader/config.json` (`"sec_user_agent": "Your Name you@example.com"`)
 or in the `SEC_USER_AGENT` environment variable.
 
-## The eleven
+## The twelve
 
 | command | job | what it does |
 | --- | --- | --- |
@@ -72,6 +107,7 @@ or in the `SEC_USER_AGENT` environment variable.
 | `/trader-alerts` | Price Alerts | Rings when a price, a stop or the opening bell hits. |
 | `/trader-analyst` | Earnings Analyst | Reads earnings reports and sums up what changed. |
 | `/trader-pelosi` | Pelosi Tracker | Reads Congress's stock-trade disclosures the minute they are filed. |
+| `/trader-backtest` | Backtest | Tests a setup across many stocks, after costs, on days it was not tuned on, and says EDGE, NO EDGE or NOT ENOUGH EVIDENCE. |
 
 ## How to use it
 
@@ -79,6 +115,7 @@ Everything lands in a `trader/` folder in your project, and each skill reads
 what the last one wrote:
 
 ```
+backtest                                                                       (weekly: which setups have an edge)
 scanner -> news -> entry -> exit -> timemachine -> budget -> risk -> broker   (one trade)
 alerts: stop, target, flat by the close                                       (while it is open)
 news / analyst / pelosi                                                        (on a schedule)
@@ -141,6 +178,9 @@ python3 trader-alerts/alerts.py add --from-plan                        # stop, t
 python3 trader-alerts/alerts.py check                                  # rings what hit, once
 python3 trader-analyst/facts.py TSLA                                   # quarters, growth, EPS
 python3 trader-pelosi/ptr.py index --member pelosi                     # her PTRs this year
+python3 trader-backtest/backtest.py run --write                         # orb, vwap, gap: EDGE or not
+python3 trader-backtest/backtest.py run --setup vwap --tickers NVDA,AMD # one setup, your stocks
+python3 trader-entry/entry.py check NVDA --setup vwap                  # the new setups, live
 ```
 
 ```bash
@@ -150,7 +190,10 @@ python3 -m unittest discover -s tests -v
 The tests run offline, on fixtures cut from real data: TSLA's 5-minute bars
 for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
 TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
-real XBRL facts. They reproduce every number in the example above.
+real XBRL facts. They reproduce every number in the example above (the Time
+Machine's with `--method iid`, the v2.0 replays, and the budget and risk
+numbers without `costs`), and check the v2.1 pieces against hand-worked
+answers.
 
 ## Fine print
 
@@ -196,6 +239,13 @@ public filings the minute they post.
 **Taxes.** Day-trading gains are short-term gains, and frequent trading makes
 wash sales likely. Nothing here is tax advice.
 
+**A backtest is evidence, not a promise.** Yahoo keeps only 60 days of
+5-minute bars, which is one market regime. The default universe is today's
+large caps, which flatters any setup a little (survivorship bias). The cost
+model is an estimate: check your broker's real spreads and fees and put them
+in `costs`. An EDGE verdict means "worth paper trading with real attention",
+never "safe to bet the account".
+
 ## Files
 
 ```
@@ -210,6 +260,7 @@ trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
+trader-backtest/    SKILL.md, backtest.py, setups.py, marketdata.py
 tests/              unittest suite + offline fixtures
 ```
 
